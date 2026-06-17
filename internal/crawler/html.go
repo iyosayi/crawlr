@@ -1,23 +1,35 @@
 package crawler
 
 import (
+	"bytes"
+	"golang.org/x/net/html"
 	"net/url"
-	"regexp"
 )
 
-var hrefRe = regexp.MustCompile(`(?i)<a\s+[^>]*href=["']([^"']+)["']`)
-
 func extractLinks(body []byte) []string {
-	matches := hrefRe.FindAllSubmatch(body, -1)
+	doc, err := html.Parse(bytes.NewReader(body))
 
-	links := make([]string, 0, len(matches))
-
-	for _, match := range matches {
-		if len(match) < 2 {
-			continue
-		}
-		links = append(links, string(match[1]))
+	if err != nil {
+		return nil
 	}
+
+	var links []string
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					links = append(links, attr.Val)
+					break
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
 	return links
 }
 

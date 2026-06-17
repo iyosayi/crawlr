@@ -379,16 +379,16 @@ func TestCrawlerRunResultCountsFailures(t *testing.T) {
 	expectedErr := errors.New("fetch failed")
 
 	c := New(Options{
-		Workers: 2,
-		MaxURLs: 2,
+		Workers:  2,
+		MaxURLs:  2,
 		MaxDepth: 0,
 		Processor: func(ctx context.Context, url string) (Result, error) {
 			if url == "https://bad.com" {
-			return Result{}, expectedErr
+				return Result{}, expectedErr
 			}
 			return Result{
 				URL: url,
-			},nil
+			}, nil
 		},
 	})
 
@@ -401,5 +401,149 @@ func TestCrawlerRunResultCountsFailures(t *testing.T) {
 	}
 	if run.FailedCount != 1 {
 		t.Fatalf("expected 1 failure, got %d", run.FailedCount)
+	}
+}
+
+func TestCrawlerRunResultIncludesTiming(t *testing.T) {
+	c := New(Options{
+		Workers:  1,
+		MaxURLs:  1,
+		MaxDepth: 0,
+	})
+
+	run, err := c.Run(context.Background(), []string{"https://example.com"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if run.StartedAt.IsZero() {
+		t.Fatal("expected StartedAt to be set")
+	}
+
+	if run.FinishedAt.IsZero() {
+		t.Fatal("expected FinishedAt to be set")
+	}
+
+	if run.Duration < 0 {
+		t.Fatalf("expected non-negative duration, got %v", run.Duration)
+	}
+
+	if run.FinishedAt.Before(run.StartedAt) {
+		t.Fatal("expected FinishedAt to be after StartedAt")
+	}
+}
+
+func TestCrawlerCanRunMultipleTimes(t *testing.T) {
+	c := New(Options{
+		Workers:  2,
+		MaxURLs:  10,
+		MaxDepth: 0,
+	})
+
+	first, err := c.Run(context.Background(), []string{
+		"https://example.com",
+	})
+	if err != nil {
+		t.Fatalf("first Run returned error: %v", err)
+	}
+
+	second, err := c.Run(context.Background(), []string{
+		"https://example.com",
+	})
+
+	if err != nil {
+		t.Fatalf("Second Run returned error: %v", err)
+	}
+
+	if first.VisitedCount != 1 {
+		t.Fatalf("expected first run visited count 1, got %d", first.VisitedCount)
+	}
+
+	if second.VisitedCount != 1 {
+		t.Fatalf("expected second run visited count 1, got %d", second.VisitedCount)
+	}
+}
+
+func TestCrawlerSameHostOnlyDoesNotLeakAllowedHostsAcrossRuns(t *testing.T) {
+	c := New(Options{
+		Workers:      2,
+		MaxURLs:      10,
+		MaxDepth:     1,
+		SameHostOnly: true,
+		Processor: func(ctx context.Context, url string) (Result, error) {
+			return Result{
+				URL: url,
+				Links: []string{
+					"https://example.com/about",
+					"https://go.dev/doc",
+				},
+			}, nil
+		},
+	})
+
+	first, err := c.Run(context.Background(), []string{
+		"https://example.com",
+	})
+	if err != nil {
+		t.Fatalf("first Run returned error: %v", err)
+	}
+
+	second, err := c.Run(context.Background(), []string{
+		"https://go.dev",
+	})
+	if err != nil {
+		t.Fatalf("second Run returned error: %v", err)
+	}
+
+	firstURLs := resultURLs(first.Results)
+	firstWant := []string{
+		"https://example.com",
+		"https://example.com/about",
+	}
+
+	if !slices.Equal(firstURLs, firstWant) {
+		t.Fatalf("expected first URLs %v, got %v", firstWant, firstURLs)
+	}
+
+	secondURLs := resultURLs(second.Results)
+	secondWant := []string{
+		"https://go.dev",
+		"https://go.dev/doc",
+	}
+
+	if !slices.Equal(secondURLs, secondWant) {
+		t.Fatalf("expected seocnd URLs %v, got %v", secondURLs, secondWant)
+	}
+}
+
+func TestCrawlerIgnoresInvalidSeeds(t *testing.T) {
+	c := New(Options{
+		Workers:  2,
+		MaxURLs:  10,
+		MaxDepth: 0,
+	})
+
+	run, err := c.Run(context.Background(), []string{
+		"not-a-url",
+		"mailto:test@example.com",
+		"javascript:void(0)",
+		"https://example.com",
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got := resultURLs(run.Results)
+
+	want := []string{
+		"https://example.com",
+	}
+
+	if !slices.Equal(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+
+	if run.VisitedCount != 1 {
+		t.Fatalf("expected visited count 1, got %d", run.VisitedCount)
 	}
 }
