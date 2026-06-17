@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"sync"
+	"time"
 )
 
 type Crawler struct {
@@ -42,6 +43,9 @@ type RunResult struct {
 	Results      []Result
 	VisitedCount int
 	FailedCount  int
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	Duration     time.Duration
 }
 
 type Processor func(ctx context.Context, url string) (Result, error)
@@ -54,6 +58,19 @@ type Job struct {
 func newRunState() *runState {
 	return &runState{
 		visited: make(map[string]struct{}),
+	}
+}
+
+func buildRunResult(startedAt time.Time, results []Result, visitedCount int) RunResult {
+	finishedAt := time.Now()
+
+	return RunResult{
+		Results:      results,
+		VisitedCount: visitedCount,
+		FailedCount:  countFailures(results),
+		StartedAt:    startedAt,
+		FinishedAt:   finishedAt,
+		Duration:     finishedAt.Sub(startedAt),
 	}
 }
 
@@ -110,25 +127,8 @@ func New(opts Options) *Crawler {
 // workers send results
 // the coordinator closes results after all workers finish
 
-func (c *Crawler) Run(ctx context.Context, seeds []string) (RunResult, error) {
-	if err := ctx.Err(); err != nil {
-		return RunResult{}, err
-	}
-	jobs := make(chan Job, c.maxURLs)
-	results := make(chan Result)
-	pending := 0
-	jobsClosed := false
-	allowedHosts := make(map[string]struct{})
-	state := newRunState()
-
+func (c *Crawler) startWorkers(ctx context.Context, jobs <-chan Job, results chan<- Result) *sync.WaitGroup {
 	var wg sync.WaitGroup
-
-	closeJobs := func() {
-		if !jobsClosed {
-			close(jobs)
-			jobsClosed = true
-		}
-	}
 
 	for range c.workers {
 		wg.Add(1)
@@ -164,38 +164,11 @@ func (c *Crawler) Run(ctx context.Context, seeds []string) (RunResult, error) {
 			}
 		}()
 	}
+	return &wg
+}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	enqueue := func(job Job) bool {
-		if job.Depth > c.maxDepth {
-			return false
-		}
-
-		if c.sameHostOnly {
-			host, ok := hostOf(job.URL)
-			if !ok {
-				return false
-			}
-
-			if _, ok := allowedHosts[host]; !ok {
-				return false
-			}
-		}
-
-		if !state.trySchedule(c.maxURLs, job.URL) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case jobs <- job:
-			return true
-		}
-	}
+func (c *Crawler) scheduleSeeds(seeds []string, allowedHosts map[string]struct{}, enqueue func(Job) bool) int {
+	scheduled := 0
 
 	for _, seed := range seeds {
 		normalized, ok := normalizeURL(seed)
@@ -212,11 +185,15 @@ func (c *Crawler) Run(ctx context.Context, seeds []string) (RunResult, error) {
 		}
 
 		if enqueue(Job{URL: normalized, Depth: 0}) {
-			pending++
+			scheduled++
 		}
 	}
+	return scheduled
+}
 
-	var out []Result
+func (c *Crawler) runScheduler(ctx context.Context, results <-chan Result, closeJobs func(), enqueue func(Job) bool, initialPending int, state *runState) ([]Result, error) {
+	pending := initialPending
+	out := make([]Result, 0, state.visitedCount())
 
 	for pending > 0 {
 		select {
@@ -226,38 +203,98 @@ func (c *Crawler) Run(ctx context.Context, seeds []string) (RunResult, error) {
 			for result := range results {
 				out = append(out, result)
 			}
-			return RunResult{
-				Results:      out,
-				VisitedCount: state.visitedCount(),
-				FailedCount: countFailures(out),
-			}, ctx.Err()
+			return out, ctx.Err()
 		case result, ok := <-results:
 			if !ok {
 				closeJobs()
-				return RunResult{
-					Results:      out,
-					VisitedCount: state.visitedCount(),
-					FailedCount: countFailures(out),
-				}, ctx.Err()
+				return out, ctx.Err()
 			}
 			pending--
 			out = append(out, result)
-			for _, link := range result.Links {
-				if enqueue(Job{URL: link, Depth: result.Depth + 1}) {
-					pending++
-				}
-			}
+			pending += c.scheduleDiscoveredLinks(result, enqueue)
 		}
 	}
 	closeJobs()
 	for result := range results {
 		out = append(out, result)
 	}
-	return RunResult{
-		Results:      out,
-		VisitedCount: state.visitedCount(),
-		FailedCount: countFailures(out),
-	}, ctx.Err()
+
+	return out, ctx.Err()
+}
+
+func (c *Crawler) scheduleDiscoveredLinks(result Result, enqueue func(Job) bool) int {
+	scheduled := 0
+
+	for _, link := range result.Links {
+		if enqueue(Job{URL: link, Depth: result.Depth + 1}) {
+			scheduled++
+		}
+	}
+	return scheduled
+}
+
+func (c *Crawler) enqueue(ctx context.Context, jobs chan<- Job, state *runState, allowedHosts map[string]struct{}, job Job) bool {
+
+	if job.Depth > c.maxDepth {
+		return false
+	}
+
+	if c.sameHostOnly {
+		host, ok := hostOf(job.URL)
+		if !ok {
+			return false
+		}
+
+		if _, ok := allowedHosts[host]; !ok {
+			return false
+		}
+	}
+
+	if !state.trySchedule(c.maxURLs, job.URL) {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case jobs <- job:
+		return true
+	}
+}
+
+func (c *Crawler) Run(ctx context.Context, seeds []string) (RunResult, error) {
+	if err := ctx.Err(); err != nil {
+		return RunResult{}, err
+	}
+	startedAt := time.Now()
+
+	jobs := make(chan Job, c.maxURLs)
+	results := make(chan Result)
+	state := newRunState()
+	allowedHosts := make(map[string]struct{})
+
+	var closeJobsOnce sync.Once
+
+	closeJobs := func() {
+		closeJobsOnce.Do(func() {
+			close(jobs)
+		})
+	}
+
+	wg := c.startWorkers(ctx, jobs, results)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	enqueue := func(job Job) bool {
+		return c.enqueue(ctx, jobs, state, allowedHosts, job)
+	}
+	pending := c.scheduleSeeds(seeds, allowedHosts, enqueue)
+
+	out, err := c.runScheduler(ctx, results, closeJobs, enqueue, pending, state)
+
+	return buildRunResult(startedAt, out, state.visitedCount()), err
 }
 
 func (c *runState) trySchedule(maxURLs int, url string) bool {
